@@ -34,6 +34,7 @@ import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from enum import Enum
 from typing import (
@@ -43,6 +44,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     TYPE_CHECKING,
     TypeAlias,
     TypeVar,
@@ -143,6 +145,32 @@ class ExceptionWithTraceback(Exception):
         self.original_exception = e
         self.stack_trace: str = traceback.format_exc()
         super().__init__(f"{e}\n{self.stack_trace}")
+
+
+@dataclass(frozen=True)
+class QuorumView:
+    """
+    The membership of one quorum, as passed to the function registered with
+    :py:meth:`Manager.set_plan_fn`.
+
+    With ``use_async_quorum=True`` or ``allow_heal=False`` it is taken once
+    the quorum RPC has returned, before ProcessGroup reconfiguration and
+    healing. A synchronous quorum that allows healing takes it after both,
+    since every participant, healed or not, trains the step it ends on.
+    """
+
+    quorum_id: int
+    # the step this replica group trains with this quorum: the step it
+    # reported to the quorum, or after a synchronous heal the healed step.
+    # An async healing replica group is outside the participants and jumps
+    # to max_step only later.
+    step: int
+    # what num_participants() returns for this quorum
+    num_participants: int
+    # what participating_rank() returns for this quorum
+    participating_rank: Optional[int]
+    # the replica_id of every participant, indexed by participating_rank
+    participating_replica_ids: Tuple[str, ...] = ()
 
 
 class Manager:
@@ -288,6 +316,11 @@ class Manager:
             max_workers=1, thread_name_prefix="async_quorum"
         )
         self._quorum_future: Optional[concurrent.futures.Future] = None
+        # see set_plan_fn; the future completes at the membership point of
+        # each quorum, before PG reconfiguration and healing
+        self._plan_fn: Optional[Callable[[QuorumView], object]] = None
+        self._plan_future: Optional[concurrent.futures.Future] = None
+        self._plan_view: Optional[QuorumView] = None
 
         self._store = TCPStore(
             host_name=store_addr,
@@ -588,12 +621,16 @@ class Manager:
 
         self._errored = None
         self._healing = False
+        self._plan_view = None
+        self._plan_future = (
+            concurrent.futures.Future() if self._plan_fn is not None else None
+        )
 
         # TODO: we should really be wrapping this whole section in a try-except
         # block to allow gracefully recovering from issues in PG setup and quorum.
 
         self._quorum_future = self._executor.submit(
-            self._async_quorum,
+            self._run_async_quorum,
             allow_heal=allow_heal,
             shrink_only=shrink_only,
             quorum_timeout=timeout or self._quorum_timeout,
@@ -626,6 +663,118 @@ class Manager:
         )
         self._quorum_future.result()
 
+    def set_plan_fn(self, fn: Optional[Callable[[QuorumView], object]]) -> None:
+        """
+        Register a function that computes a per-step plan from each quorum's
+        membership. Call it before :py:meth:`start_quorum`; it applies from
+        the next quorum on.
+
+        The function runs on the quorum thread and its result is returned by
+        :py:meth:`wait_plan`. With ``use_async_quorum=True`` or
+        ``allow_heal=False`` it runs as soon as the quorum RPC has returned,
+        before ProcessGroup reconfiguration and healing, so the forward pass
+        can start without waiting for them. A synchronous quorum that allows
+        healing runs it after both: :py:meth:`start_quorum` waits for them
+        anyway, and a healed replica group participates in the step, so the
+        plan must see its healed step. It must only compute: it must not call
+        the Manager methods that wait for the quorum (which would deadlock),
+        nor do I/O or collectives, since the rest of the quorum waits for it.
+
+        The function cannot be changed while a quorum is in progress, since
+        that quorum's waiters would be left with a plan that never completes.
+        Unregister or replace it between rounds, after :py:meth:`wait_quorum`
+        (or ``should_commit()``) of the previous round, and before
+        :py:meth:`start_quorum` of the next.
+
+        Args:
+            fn: the plan function, or None to unregister
+        Raises:
+            RuntimeError: if a quorum is in progress
+        """
+        if self._quorum_future is not None and not self._quorum_future.done():
+            raise RuntimeError(
+                "cannot change the plan fn while a quorum is in progress; "
+                "wait for wait_quorum() first"
+            )
+        self._plan_fn = fn
+
+    @torch.profiler.record_function("torchft::manager::wait_plan")
+    def wait_plan(self) -> object:
+        """
+        Wait for the plan of the current quorum.
+
+        Unlike :py:meth:`wait_quorum` this does not wait for ProcessGroup
+        reconfiguration or healing, except with a synchronous quorum that
+        allows healing, where the plan is computed after them (see
+        :py:meth:`set_plan_fn`).
+
+        Returns:
+            what the function registered with :py:meth:`set_plan_fn` returned
+        Raises:
+            RuntimeError: if no plan function was registered before
+                :py:meth:`start_quorum`
+            Exception: what the plan function or the quorum RPC raised
+        """
+        if self._plan_future is None:
+            raise RuntimeError(
+                "no quorum: call set_plan_fn() and then start_quorum() before "
+                "wait_plan()"
+            )
+        return self._plan_future.result()
+
+    def _plan_num_participants(self) -> int:
+        """
+        num_participants() as of the membership point when a plan function is
+        registered, so callers that need it during the forward/backward pass
+        (:py:meth:`ManagedProcessGroup.size`) do not wait for reconfiguration
+        and healing. Without a plan function this is num_participants().
+        """
+        plan_future = self._plan_future
+        if plan_future is None:
+            return self.num_participants()
+        concurrent.futures.wait([plan_future])
+        view = self._plan_view
+        if view is None:
+            # the quorum failed before membership: raise its error
+            return self.num_participants()
+        return view.num_participants
+
+    def _run_async_quorum(self, **kwargs: Any) -> None:
+        # a failure before the membership point (e.g. the quorum RPC itself)
+        # must also reach wait_plan(), or its waiters would hang
+        try:
+            self._async_quorum(**kwargs)
+        except BaseException as e:
+            plan_future = self._plan_future
+            if plan_future is not None and not plan_future.done():
+                plan_future.set_exception(e)
+            raise
+
+        # A synchronous quorum that allows healing plans here, after every
+        # return path of _async_quorum, including a reconfiguration or
+        # recovery error that it only reports: the step does not commit then,
+        # but wait_plan() must not hang.
+        plan_view = self._plan_view
+        plan_future = self._plan_future
+        if plan_view is not None and plan_future is not None and not plan_future.done():
+            self._plan_view = replace(plan_view, step=self._step)
+            self._compute_plan(self._plan_view, plan_future)
+
+    def _compute_plan(
+        self, view: QuorumView, plan_future: concurrent.futures.Future
+    ) -> None:
+        plan_fn = self._plan_fn
+        assert plan_fn is not None, "plan future without a plan fn"
+        try:
+            plan = plan_fn(view)
+        except Exception as e:
+            # a planning error is not a quorum error: only the plan's
+            # waiters see it, reconfiguration and healing go on
+            self._logger.exception(f"got exception in plan fn: {e}")
+            plan_future.set_exception(e)
+        else:
+            plan_future.set_result(plan)
+
     @torch.profiler.record_function("torchft::manager::_async_quorum")
     def _async_quorum(
         self,
@@ -640,10 +789,11 @@ class Manager:
             torch.accelerator.set_device_index(curr_device)
 
         quorum = None
+        step = self._step
         with torch.profiler.record_function("torchft::manager::_client::_quorum"):
             quorum = self._client._quorum(
                 group_rank=self._group_rank,
-                step=self._step,
+                step=step,
                 checkpoint_metadata=self._checkpoint_transport.metadata(),
                 shrink_only=shrink_only,
                 timeout=quorum_timeout,
@@ -676,6 +826,11 @@ class Manager:
             if self._use_async_quorum or not allow_heal
             else (replica_rank, replica_world_size)
         )
+        participating_replica_ids = (
+            quorum.max_replica_ids
+            if self._use_async_quorum or not allow_heal
+            else replica_ids
+        )
 
         # For fixed with spares we need to ensure that we don't have more
         # participating replicas than the min replica size.
@@ -683,11 +838,30 @@ class Manager:
             self._participating_replica_world_size = min(
                 self._participating_replica_world_size, self._min_replica_size
             )
+            participating_replica_ids = participating_replica_ids[
+                : self._min_replica_size
+            ]
             if (
                 self._participating_replica_rank is not None
                 and self._participating_replica_rank >= self._min_replica_size
             ):
                 self._participating_replica_rank = None
+
+        # membership point: hand the plan to wait_plan() before the expensive
+        # reconfiguration and healing below. A synchronous quorum that allows
+        # healing only records the membership here; _run_async_quorum plans
+        # once healing has set the step this replica group trains.
+        plan_future = self._plan_future
+        if self._plan_fn is not None and plan_future is not None:
+            self._plan_view = QuorumView(
+                quorum_id=quorum_id,
+                step=step,
+                num_participants=self._participating_replica_world_size,
+                participating_rank=self._participating_replica_rank,
+                participating_replica_ids=tuple(participating_replica_ids),
+            )
+            if self._use_async_quorum or not allow_heal:
+                self._compute_plan(self._plan_view, plan_future)
 
         if quorum_id != self._quorum_id:
             self.quorum_logger.info(
@@ -999,6 +1173,28 @@ class Manager:
             the total number of batches committed
         """
         return self._batches_committed
+
+    def replica_id(self) -> Optional[str]:
+        """
+        Get the replica_id this Manager was constructed with, without the
+        per-process UUID suffix that the quorum's replica ids carry.
+
+        Returns:
+            the replica_id, or None if none was given
+        """
+        return self._replica_id
+
+    def min_replica_size(self) -> int:
+        """
+        Get the minimum number of replicas required to commit a step.
+
+        Under ``WorldSizeMode.FIXED_WITH_SPARES`` this is also the number of
+        participating replicas.
+
+        Returns:
+            the configured minimum replica size
+        """
+        return self._min_replica_size
 
     def participating_rank(self) -> Optional[int]:
         """

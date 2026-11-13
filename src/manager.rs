@@ -621,6 +621,10 @@ fn compute_quorum_results(
             .max()
             .unwrap_or(0),
         replica_ids: participants.iter().map(|p| p.replica_id.clone()).collect(),
+        max_replica_ids: max_participants
+            .iter()
+            .map(|p| p.replica_id.clone())
+            .collect(),
     })
 }
 
@@ -999,6 +1003,11 @@ mod tests {
         assert_eq!(results.replica_rank, 0);
         assert_eq!(results.recover_src_replica_rank, Some(1));
         assert!(results.recover_dst_replica_ranks.is_empty());
+        // only the replicas at max_step, in max_replica_rank order
+        assert_eq!(
+            results.max_replica_ids,
+            vec!["replica_1".to_string(), "replica_3".to_string()]
+        );
 
         let results = compute_quorum_results("replica_1", 0, &quorum, true)?;
         assert!(!results.heal);

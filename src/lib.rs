@@ -216,6 +216,7 @@ impl ManagerClient {
                 max_world_size: resp.max_world_size,
                 heal: resp.heal,
                 replica_ids: resp.replica_ids,
+                max_replica_ids: resp.max_replica_ids,
             })
         })
     }
@@ -297,6 +298,7 @@ struct QuorumResult {
     max_world_size: i64,
     heal: bool,
     replica_ids: Vec<String>,
+    max_replica_ids: Vec<String>,
 }
 
 #[pymethods]
@@ -316,6 +318,7 @@ impl QuorumResult {
             max_world_size: 1,
             heal: false,
             replica_ids: Vec::new(),
+            max_replica_ids: Vec::new(),
         }
     }
 }

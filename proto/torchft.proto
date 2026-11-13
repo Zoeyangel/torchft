@@ -97,6 +97,9 @@ message ManagerQuorumResponse {
   bool heal = 11;
   int64 commit_failures = 12;
   repeated string replica_ids = 13;
+  // replica_ids of the replicas at max_step, in max_replica_rank order: the
+  // participants of an async quorum.
+  repeated string max_replica_ids = 14;
 }
 
 message CheckpointMetadataRequest {
