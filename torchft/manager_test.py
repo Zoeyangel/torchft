@@ -185,6 +185,57 @@ class TestManager(TestCase):
         self.assertEqual(manager.batches_committed(), 2)
 
     @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_before_reconfiguration(
+        self, client_mock: MagicMock
+    ) -> None:
+        manager = self._create_manager()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        # pyre-ignore[16]: _pg is mocked
+        manager._pg.configure.side_effect = lambda *args: release.wait(10)
+
+        quorum = QuorumResult()
+        quorum.quorum_id = 123
+        quorum.replica_rank = 1
+        quorum.replica_world_size = 3
+        quorum.store_address = f"localhost:{self.store.port}"
+        quorum.max_step = 1
+        quorum.max_replica_rank = 0
+        quorum.max_world_size = 2
+        quorum.heal = False
+        # replicas at max_step first, then the rest
+        quorum.replica_ids = ["replica_0:uuid", "replica_1:uuid", "replica_2:uuid"]
+        client_mock()._quorum.return_value = quorum
+
+        manager.start_quorum()
+        # async quorum participants are the first max_world_size entries
+        self.assertEqual(
+            manager.wait_membership(), ("replica_0:uuid", "replica_1:uuid")
+        )
+        # membership is out while the round is still reconfiguring
+        assert manager._quorum_future is not None
+        self.assertFalse(manager._quorum_future.done())
+
+        release.set()
+        manager.wait_quorum()
+        self.assertEqual(manager.num_participants(), 2)
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_before_start_quorum(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager()
+        with self.assertRaisesRegex(RuntimeError, "no quorum"):
+            manager.wait_membership()
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_quorum_error(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager()
+        client_mock()._quorum.side_effect = RuntimeError("quorum rpc failed")
+        manager.start_quorum()
+        # a failed quorum must not leave wait_membership() hanging
+        with self.assertRaisesRegex(RuntimeError, "quorum rpc failed"):
+            manager.wait_membership()
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
     def test_quorum_heal_sync(self, client_mock: MagicMock) -> None:
         manager = self._create_manager(use_async_quorum=False)
         client_mock().should_commit = mock_should_commit

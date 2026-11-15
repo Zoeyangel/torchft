@@ -620,7 +620,21 @@ fn compute_quorum_results(
             .map(|p| p.commit_failures)
             .max()
             .unwrap_or(0),
-        replica_ids: participants.iter().map(|p| p.replica_id.clone()).collect(),
+        // The replicas at max_step first, in max_replica_rank order, then the
+        // rest: the first max_world_size entries are the participants of an
+        // async quorum. Each part keeps the replica_id order the rest of this
+        // function uses.
+        replica_ids: {
+            let mut out = Vec::with_capacity(participants.len());
+            out.extend(max_participants.iter().map(|p| p.replica_id.clone()));
+            out.extend(
+                participants
+                    .iter()
+                    .filter(|p| p.step != max_step)
+                    .map(|p| p.replica_id.clone()),
+            );
+            out
+        },
     })
 }
 
@@ -999,6 +1013,19 @@ mod tests {
         assert_eq!(results.replica_rank, 0);
         assert_eq!(results.recover_src_replica_rank, Some(1));
         assert!(results.recover_dst_replica_ranks.is_empty());
+        // the replicas at max_step first, in max_replica_rank order, then the
+        // rest: the first max_world_size entries are the async participants
+        assert_eq!(results.max_world_size, 2);
+        assert_eq!(
+            results.replica_ids,
+            vec![
+                "replica_1".to_string(),
+                "replica_3".to_string(),
+                "replica_0".to_string(),
+                "replica_2".to_string(),
+                "replica_4".to_string(),
+            ]
+        );
 
         let results = compute_quorum_results("replica_1", 0, &quorum, true)?;
         assert!(!results.heal);
