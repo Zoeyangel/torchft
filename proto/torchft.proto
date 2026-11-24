@@ -97,6 +97,7 @@ message ManagerQuorumResponse {
   bool heal = 11;
   int64 commit_failures = 12;
   repeated string replica_ids = 13;
+  repeated string max_replica_ids = 14;
 }
 
 message CheckpointMetadataRequest {

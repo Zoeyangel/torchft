@@ -43,6 +43,7 @@ class QuorumResult:
     heal: bool
     commit_failures: int
     replica_ids: list[str]
+    max_replica_ids: list[str]
 
 class ManagerServer:
     def __init__(

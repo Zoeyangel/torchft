@@ -620,6 +620,7 @@ fn compute_quorum_results(
             .map(|p| p.commit_failures)
             .max()
             .unwrap_or(0),
+        max_replica_ids: max_participants.iter().map(|p| p.replica_id.clone()).collect(),
         replica_ids: participants.iter().map(|p| p.replica_id.clone()).collect(),
     })
 }
@@ -753,6 +754,8 @@ mod tests {
         assert_eq!(resp.replica_world_size, 1);
         assert_eq!(resp.heal, false);
         assert_eq!(resp.commit_failures, 3);
+        assert_eq!(resp.max_replica_ids, vec!["rep_id".to_string()]);
+        assert_eq!(resp.replica_ids, vec!["rep_id".to_string()]);
 
         Ok(())
     }
@@ -999,6 +1002,21 @@ mod tests {
         assert_eq!(results.replica_rank, 0);
         assert_eq!(results.recover_src_replica_rank, Some(1));
         assert!(results.recover_dst_replica_ranks.is_empty());
+        assert_eq!(results.max_world_size, 2);
+        assert_eq!(
+            results.max_replica_ids,
+            vec!["replica_1".to_string(), "replica_3".to_string()]
+        );
+        assert_eq!(
+            results.replica_ids,
+            vec![
+                "replica_0".to_string(),
+                "replica_1".to_string(),
+                "replica_2".to_string(),
+                "replica_3".to_string(),
+                "replica_4".to_string(),
+            ]
+        );
 
         let results = compute_quorum_results("replica_1", 0, &quorum, true)?;
         assert!(!results.heal);

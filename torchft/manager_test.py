@@ -53,6 +53,7 @@ class TestManager(TestCase):
         timeout: timedelta = timedelta(seconds=10),
         init_sync: bool = True,
         max_retries: Optional[int] = None,
+        replica_id: str = "dummy_id",
     ) -> Manager:
         pg = create_autospec(ProcessGroup)
         pg.errored.return_value = None
@@ -61,7 +62,7 @@ class TestManager(TestCase):
             host_name="localhost", port=0, is_master=True, wait_for_workers=False
         )
         self.store.set(MANAGER_ADDR_KEY, "dummy")
-        self.store.set(REPLICA_ID_KEY, "dummy_id")
+        self.store.set(REPLICA_ID_KEY, replica_id)
         with patch(
             "os.environ",
             {
@@ -183,6 +184,127 @@ class TestManager(TestCase):
 
         manager.start_quorum()
         self.assertEqual(manager.batches_committed(), 2)
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_before_reconfiguration(
+        self, client_mock: MagicMock
+    ) -> None:
+        manager = self._create_manager()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        # pyre-ignore[16]: _pg is mocked
+        manager._pg.configure.side_effect = lambda *args: release.wait(10)
+
+        quorum = QuorumResult()
+        quorum.quorum_id = 123
+        quorum.replica_rank = 1
+        quorum.replica_world_size = 3
+        quorum.store_address = f"localhost:{self.store.port}"
+        quorum.max_step = 1
+        quorum.max_replica_rank = 0
+        quorum.max_world_size = 2
+        quorum.heal = False
+        quorum.replica_ids = ["replica_0:uuid", "replica_1:uuid", "replica_2:uuid"]
+        quorum.max_replica_ids = ["replica_0:uuid", "replica_2:uuid"]
+        client_mock()._quorum.return_value = quorum
+
+        manager.start_quorum()
+        self.assertEqual(
+            manager.wait_membership(), ("replica_0:uuid", "replica_2:uuid")
+        )
+        # membership is out while the round is still reconfiguring
+        assert manager._quorum_future is not None
+        self.assertFalse(manager._quorum_future.done())
+
+        release.set()
+        manager.wait_quorum()
+        self.assertEqual(manager.num_participants(), 2)
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_before_start_quorum(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager()
+        with self.assertRaisesRegex(RuntimeError, "no quorum"):
+            manager.wait_membership()
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_quorum_error(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager()
+        client_mock()._quorum.side_effect = RuntimeError("quorum rpc failed")
+        manager.start_quorum()
+        # a failed quorum must not leave wait_membership() hanging
+        with self.assertRaisesRegex(RuntimeError, "quorum rpc failed"):
+            manager.wait_membership()
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_sync_heal_fixed_with_spares(
+        self, client_mock: MagicMock
+    ) -> None:
+        # A synchronous quorum that heals ranks participants over all members,
+        # so FIXED_WITH_SPARES keeps the first min_replica_size in replica_id
+        # order. replica_0 is a step behind and replica_2 is the spare: the
+        # membership must name 0 and 1, not the max_step pair.
+        manager = self._create_manager(
+            use_async_quorum=False,
+            min_replica_size=2,
+            world_size_mode=WorldSizeMode.FIXED_WITH_SPARES,
+            replica_id="replica_2:uuid",
+        )
+
+        quorum = QuorumResult()
+        quorum.quorum_id = 123
+        quorum.replica_rank = 2
+        quorum.replica_world_size = 3
+        quorum.store_address = f"localhost:{self.store.port}"
+        quorum.max_step = 20
+        quorum.max_replica_rank = 1
+        quorum.max_world_size = 2
+        quorum.heal = False
+        quorum.replica_ids = ["replica_0:uuid", "replica_1:uuid", "replica_2:uuid"]
+        quorum.max_replica_ids = ["replica_1:uuid", "replica_2:uuid"]
+        client_mock()._quorum.return_value = quorum
+
+        manager.start_quorum()
+
+        self.assertEqual(
+            manager.wait_membership(), ("replica_0:uuid", "replica_1:uuid")
+        )
+        self.assertEqual(manager.num_participants(), 2)
+        self.assertFalse(manager.is_participating())
+        # group_world_size=2 and group_rank=1 make replicas 0/1/2 the global
+        # ranks 1/3/5.
+        # pyre-ignore[16]: _pg is mocked
+        self.assertEqual(manager._pg.configure.call_args.args[7], [1, 3, 5])
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_wait_membership_sync_heal_dynamic(self, client_mock: MagicMock) -> None:
+        # Without spares every member participates, so the membership is the
+        # whole member list in replica_id order, the order replica_rank
+        # indexes into.
+        manager = self._create_manager(
+            use_async_quorum=False, replica_id="replica_1:uuid"
+        )
+
+        quorum = QuorumResult()
+        quorum.quorum_id = 123
+        quorum.replica_rank = 1
+        quorum.replica_world_size = 3
+        quorum.store_address = f"localhost:{self.store.port}"
+        quorum.max_step = 20
+        quorum.max_replica_rank = 0
+        quorum.max_world_size = 2
+        quorum.heal = False
+        quorum.replica_ids = ["replica_0:uuid", "replica_1:uuid", "replica_2:uuid"]
+        quorum.max_replica_ids = ["replica_1:uuid", "replica_2:uuid"]
+        client_mock()._quorum.return_value = quorum
+
+        manager.start_quorum()
+
+        self.assertEqual(
+            manager.wait_membership(),
+            ("replica_0:uuid", "replica_1:uuid", "replica_2:uuid"),
+        )
+        self.assertEqual(manager.num_participants(), 3)
+        self.assertTrue(manager.is_participating())
 
     @patch("torchft.manager.ManagerClient", autospec=True)
     def test_quorum_heal_sync(self, client_mock: MagicMock) -> None:

@@ -43,6 +43,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     TYPE_CHECKING,
     TypeAlias,
     TypeVar,
@@ -288,6 +289,8 @@ class Manager:
             max_workers=1, thread_name_prefix="async_quorum"
         )
         self._quorum_future: Optional[concurrent.futures.Future] = None
+        # see wait_membership
+        self._membership_future: Optional[concurrent.futures.Future] = None
 
         self._store = TCPStore(
             host_name=store_addr,
@@ -588,12 +591,13 @@ class Manager:
 
         self._errored = None
         self._healing = False
+        self._membership_future = concurrent.futures.Future()
 
         # TODO: we should really be wrapping this whole section in a try-except
         # block to allow gracefully recovering from issues in PG setup and quorum.
 
         self._quorum_future = self._executor.submit(
-            self._async_quorum,
+            self._run_async_quorum,
             allow_heal=allow_heal,
             shrink_only=shrink_only,
             quorum_timeout=timeout or self._quorum_timeout,
@@ -625,6 +629,39 @@ class Manager:
             "must call start_quorum before wait_quorum"
         )
         self._quorum_future.result()
+
+    @torch.profiler.record_function("torchft::manager::wait_membership")
+    def wait_membership(self) -> Tuple[str, ...]:
+        """
+        The replica IDs of the current quorum's participants, in the order
+        :py:meth:`participating_rank` indexes into.
+
+        Returns as soon as the quorum RPC has, before ProcessGroup
+        reconfiguration and healing. With ``use_async_quorum=False``
+        :py:meth:`start_quorum` has already waited, so it returns at once.
+
+        Returns:
+            the replica_id of every participant, indexed by participating rank
+        Raises:
+            RuntimeError: if no quorum is in progress
+            Exception: what the quorum RPC raised
+        """
+        if self._membership_future is None:
+            raise RuntimeError(
+                "no quorum: call start_quorum() before wait_membership()"
+            )
+        return cast(Tuple[str, ...], self._membership_future.result())
+
+    def _run_async_quorum(self, **kwargs: Any) -> None:
+        # a failure before the membership point must reach wait_membership()
+        # too, or its waiters would hang
+        try:
+            self._async_quorum(**kwargs)
+        except BaseException as e:
+            membership = self._membership_future
+            if membership is not None and not membership.done():
+                membership.set_exception(e)
+            raise
 
     @torch.profiler.record_function("torchft::manager::_async_quorum")
     def _async_quorum(
@@ -661,6 +698,7 @@ class Manager:
         max_replica_world_size = quorum.max_world_size
         heal = quorum.heal
         replica_ids = quorum.replica_ids
+        max_replica_ids = quorum.max_replica_ids
 
         ranks_in_quorum = [
             extract_trailing_digits(replica_id.split(":")[0]) * self._group_world_size
@@ -668,15 +706,20 @@ class Manager:
             for replica_id in replica_ids
         ]
 
-        # When using async quorum we need to take the recovered workers.
-        # When not using async quorum we need to take the max world size as all
-        # workers will be healthy.
-        self._participating_replica_rank, self._participating_replica_world_size = (
-            (max_replica_rank, max_replica_world_size)
-            if self._use_async_quorum or not allow_heal
-            else (replica_rank, replica_world_size)
-        )
-
+        # An async quorum ranks participants within the replicas at max_step:
+        # a replica still healing sits the round out. A synchronous quorum that
+        # heals has brought every member up to max_step before the forwards
+        # pass, so it ranks them within all members.
+        # participant_ids is the list participating_replica_rank indexes into,
+        # which makes the membership below a prefix of it.
+        if self._use_async_quorum or not allow_heal:
+            self._participating_replica_rank = max_replica_rank
+            self._participating_replica_world_size = max_replica_world_size
+            participant_ids = max_replica_ids
+        else:
+            self._participating_replica_rank = replica_rank
+            self._participating_replica_world_size = replica_world_size
+            participant_ids = replica_ids
         # For fixed with spares we need to ensure that we don't have more
         # participating replicas than the min replica size.
         if self._replica_world_size_mode == WorldSizeMode.FIXED_WITH_SPARES:
@@ -688,6 +731,14 @@ class Manager:
                 and self._participating_replica_rank >= self._min_replica_size
             ):
                 self._participating_replica_rank = None
+
+        # the participants are the first participating_replica_world_size
+        # entries of the list participating_replica_rank indexes into
+        membership = self._membership_future
+        if membership is not None and not membership.done():
+            membership.set_result(
+                tuple(participant_ids[: self._participating_replica_world_size])
+            )
 
         if quorum_id != self._quorum_id:
             self.quorum_logger.info(
